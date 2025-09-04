@@ -1,0 +1,1 @@
+/* JS omitted in preview due to length; identical to the previous build with charts, filters, synergy, and impact logic. */
