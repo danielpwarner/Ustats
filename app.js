@@ -1,1 +1,646 @@
-/* JS omitted in preview due to length; identical to the previous build with charts, filters, synergy, and impact logic. */
+
+/* Ultimate Team Analytics — Web (client-only JS) */
+
+const DATE_CANDIDATES = ["Date","Game Date","Timestamp","date","game_date"];
+const GAME_CANDIDATES = ["Game","Game ID","Match","Opponent","Vs","Fixture","Event","game","opponent"];
+
+let RAW = [];       // unfiltered rows
+let DF = [];        // filtered rows
+let COLS = [];      // column names
+let dateCol = null; // detected date column
+let gameCol = null; // detected game column
+let lineCol = null; // detected line column
+
+// ---------- Utilities ----------
+const byId = id => document.getElementById(id);
+const uniq = arr => [...new Set(arr)];
+const sum = arr => arr.reduce((a,b)=>a+(+b||0),0);
+const fmt = n => new Intl.NumberFormat().format(n);
+
+function detectColumns(rows){
+  COLS = rows.length ? Object.keys(rows[0]) : [];
+  // date
+  dateCol = null;
+  for(const c of DATE_CANDIDATES){
+    if(COLS.includes(c)){ dateCol = c; break; }
+  }
+  if(!dateCol){
+    for(const c of COLS){
+      if(c.toLowerCase().includes("date")){ dateCol = c; break; }
+    }
+  }
+  // game
+  gameCol = null;
+  for(const c of GAME_CANDIDATES){
+    if(COLS.includes(c)){ gameCol = c; break; }
+  }
+  if(!gameCol){
+    for(const c of COLS){
+      const s = c.toLowerCase();
+      if(s.includes("game")||s.includes("opponent")||s.includes("match")){ gameCol = c; break; }
+    }
+  }
+  // line
+  lineCol = null;
+  const candidates = ["Line","Unit","LineType","Line Type","O/D","O-D","OD","Offense/Defense"];
+  for(const c of candidates){
+    if(COLS.includes(c)){ lineCol = c; break; }
+  }
+  if(!lineCol){
+    for(const c of COLS){
+      if(c.toLowerCase().includes("line")){ lineCol = c; break; }
+    }
+  }
+}
+
+function toLine(v){
+  if(v==null) return null;
+  const s = String(v).trim().toLowerCase();
+  if(s.startsWith("o")||s.includes("off")) return "O";
+  if(s.startsWith("d")||s.includes("def")) return "D";
+  return v;
+}
+
+function normalizeLineValues(rows){
+  if(!lineCol) return rows;
+  return rows.map(r => ({...r, Line: toLine(r[lineCol])}));
+}
+
+function parseDate(s){
+  if(!s) return null;
+  const d = dayjs(s);
+  return d.isValid() ? d.toDate() : null;
+}
+
+// ---------- Data ingestion ----------
+byId('fileInput').addEventListener('change', (e)=>{
+  const f = e.target.files[0];
+  if(!f){ return; }
+  Papa.parse(f, {
+    header:true,
+    dynamicTyping:false,
+    skipEmptyLines:true,
+    complete: res => {
+      RAW = res.data.map(obj => {
+        const out = {};
+        Object.keys(obj).forEach(k => {
+          const v = obj[k];
+          out[k.trim()] = (typeof v === 'string') ? v.trim() : v;
+        });
+        return out;
+      });
+      detectColumns(RAW);
+      RAW = normalizeLineValues(RAW);
+      populateFilters();
+      applyFilters();
+    },
+    error: err => {
+      console.error("Papa parse error:", err);
+      alert("There was a problem reading that CSV. Check the browser console for details.");
+    }
+  });
+});
+
+function populateFilters(){
+  // Games
+  const sel = byId('gameFilter');
+  sel.innerHTML = '';
+  if(gameCol){
+    const opts = uniq(RAW.map(r => String(r[gameCol]||'').trim()).filter(Boolean)).sort();
+    for(const o of opts){
+      const opt = document.createElement('option');
+      opt.value = o; opt.textContent = o;
+      sel.appendChild(opt);
+    }
+  }
+  // Dates
+  if(dateCol){
+    const dates = RAW.map(r => parseDate(r[dateCol])).filter(Boolean);
+    if(dates.length){
+      const min = new Date(Math.min(...dates));
+      const max = new Date(Math.max(...dates));
+      byId('dateStart').value = min.toISOString().slice(0,10);
+      byId('dateEnd').value = max.toISOString().slice(0,10);
+    }
+  }
+  // Ego options
+  const synEgo = byId('synEgo');
+  synEgo.innerHTML = '<option value=""></option>';
+  const players = uniq([
+    ...RAW.map(r=>String(r.Passer||'')).filter(Boolean),
+    ...RAW.map(r=>String(r.Receiver||'')).filter(Boolean)
+  ]).sort();
+  for(const p of players){
+    const opt = document.createElement('option');
+    opt.value = p; opt.textContent = p;
+    synEgo.appendChild(opt);
+  }
+  // Player selects
+  const allPlayers = uniq([
+    ...RAW.map(r=>String(r.Passer||'')).filter(Boolean),
+    ...RAW.map(r=>String(r.Receiver||'')).filter(Boolean),
+    ...RAW.map(r=>String(r.Defender||'')).filter(Boolean)
+  ]).sort();
+  const playerSelect = byId('playerSelect');
+  const cmpA = byId('cmpA');
+  const cmpB = byId('cmpB');
+  [playerSelect, cmpA, cmpB].forEach(el => { el.innerHTML = ''; });
+  for(const p of allPlayers){
+    for(const el of [playerSelect, cmpA, cmpB]){
+      const opt = document.createElement('option');
+      opt.value = p; opt.textContent = p;
+      el.appendChild(opt.cloneNode(true));
+    }
+  }
+}
+
+byId('applyFilters').addEventListener('click', applyFilters);
+
+function getSelectedValues(selectEl){
+  return Array.from(selectEl.options).filter(o=>o.selected).map(o=>o.value);
+}
+
+function applyFilters(){
+  if(!RAW.length){ return; }
+  const games = getSelectedValues(byId('gameFilter'));
+  const lineO = byId('lineO').checked;
+  const lineD = byId('lineD').checked;
+  const dStart = byId('dateStart').value ? new Date(byId('dateStart').value) : null;
+  const dEnd = byId('dateEnd').value ? new Date(byId('dateEnd').value) : null;
+
+  DF = RAW.filter(r => {
+    // Date
+    if(dateCol){
+      const d = parseDate(r[dateCol]);
+      if(dStart && d && d < dStart) return false;
+      if(dEnd && d && d > dEnd) return false;
+    }
+    // Games
+    if(gameCol && games.length){
+      const g = String(r[gameCol]||'').trim();
+      if(!games.includes(g)) return false;
+    }
+    // Line
+    if(lineCol){
+      const val = toLine(r[lineCol]);
+      if(val === "O" && !lineO) return false;
+      if(val === "D" && !lineD) return false;
+    }
+    return true;
+  });
+
+  // Render active tab
+  renderActiveTab();
+}
+
+// ---------- Stats ----------
+function teamCounts(rows){
+  const cats = ["Catch","Throwaway","Goal","Drop","D","Pull","Callahan"];
+  const out = {}; cats.forEach(c=> out[c]=0);
+  for(const r of rows){
+    const a = r.Action;
+    if(out.hasOwnProperty(a)) out[a]++;
+  }
+  return out;
+}
+
+function computePasserStats(rows){
+  const map = {};
+  for(const r of rows){
+    const p = r.Passer;
+    if(!p) continue;
+    map[p] = map[p] || {Player:p, total:0, comp:0, to:0};
+    map[p].total++;
+    if(r.Action==="Catch"||r.Action==="Goal") map[p].comp++;
+    if(r.Action==="Throwaway"||r.Action==="Drop") map[p].to++;
+  }
+  const list = Object.values(map).map(o => ({
+    Player:o.Player,
+    "Passes Thrown":o.total,
+    "Completions":o.comp,
+    "Turnovers":o.to,
+    "Completion %": o.total? (o.comp/o.total*100):0,
+    "Turnover %": o.total? (o.to/o.total*100):0
+  }));
+  list.sort((a,b)=> b["Passes Thrown"] - a["Passes Thrown"]);
+  return list;
+}
+
+function computeReceiverStats(rows){
+  const map = {};
+  for(const r of rows){
+    const p = r.Receiver;
+    if(!p) continue;
+    map[p] = map[p] || {Player:p, catches:0, goals:0};
+    if(r.Action==="Catch") map[p].catches++;
+    if(r.Action==="Goal") map[p].goals++;
+  }
+  const list = Object.values(map).map(o => ({
+    Player:o.Player,
+    "Catches":o.catches,
+    "Goals Caught":o.goals
+  }));
+  list.sort((a,b)=> b["Goals Caught"] - a["Goals Caught"] || b["Catches"] - a["Catches"]);
+  return list;
+}
+
+function computeDefenderStats(rows){
+  const map = {};
+  for(const r of rows){
+    const p = r.Defender;
+    if(!p) continue;
+    map[p] = map[p] || {Player:p, Blocks:0, Pulls:0, "Pulls OB":0, Callahans:0};
+    if(r.Action==="D") map[p].Blocks++;
+    if(r.Action==="Pull") map[p].Pulls++;
+    if(r.Action==="PullOb") map[p]["Pulls OB"]++;
+    if(r.Action==="Callahan") map[p].Callahans++;
+  }
+  const list = Object.values(map);
+  list.sort((a,b)=> b.Blocks - a.Blocks || b.Pulls - a.Pulls);
+  return list;
+}
+
+function computeAssists(rows){
+  const map = {};
+  for(const r of rows){
+    if(r.Action==="Goal" && r.Passer){
+      map[r.Passer] = (map[r.Passer]||0)+1;
+    }
+  }
+  const list = Object.entries(map).map(([Player,Assists])=>({Player,Assists}));
+  list.sort((a,b)=> b.Assists - a.Assists);
+  return list;
+}
+
+function computeTouches(rows){
+  const p = computePasserStats(rows).map(r=>({Player:r.Player, Passes:r["Passes Thrown"]}));
+  const rc = computeReceiverStats(rows).map(r=>({Player:r.Player, Catches:r["Catches"]}));
+  const map = {};
+  for(const r of p){ map[r.Player] = map[r.Player] || {Player:r.Player, Passes:0, Catches:0}; map[r.Player].Passes += r.Passes; }
+  for(const r of rc){ map[r.Player] = map[r.Player] || {Player:r.Player, Passes:0, Catches:0}; map[r.Player].Catches += r.Catches; }
+  const list = Object.values(map).map(o=>({Player:o.Player, Touches:(o.Passes||0)+(o.Catches||0)}));
+  list.sort((a,b)=> b.Touches - a.Touches);
+  return list;
+}
+
+function connectionMatrix(rows, successOnly=true){
+  const ok = successOnly ? rows.filter(r=> r.Action==="Catch"||r.Action==="Goal") : rows.slice();
+  const pairs = {};
+  for(const r of ok){
+    const a = r.Passer, b = r.Receiver;
+    if(!a||!b) continue;
+    pairs[a] = pairs[a] || {};
+    pairs[a][b] = (pairs[a][b]||0) + 1;
+  }
+  return pairs; // nested map [Passer][Receiver] = count
+}
+
+function synergy(rows){
+  const map = {};
+  for(const r of rows){
+    const a = r.Passer, b = r.Receiver;
+    if(!a||!b) continue;
+    const key = a+"__"+b;
+    map[key] = map[key] || {Passer:a, Receiver:b, Attempts:0, Successes:0};
+    map[key].Attempts++;
+    if(r.Action==="Catch"||r.Action==="Goal") map[key].Successes++;
+  }
+  const list = Object.values(map).map(o=>({...o, "Success %": o.Attempts? (o.Successes/o.Attempts*100):0}));
+  list.sort((x,y)=> y.Successes - x.Successes || y.Attempts - x.Attempts || y["Success %"] - x["Success %"]);
+  return list;
+}
+
+function zscore(values){
+  const n = values.length;
+  if(!n) return [];
+  const mean = values.reduce((a,b)=>a+b,0)/n;
+  const variance = values.reduce((a,b)=> a + Math.pow(b-mean,2), 0)/n;
+  const std = Math.sqrt(variance);
+  if(std===0) return values.map(_=>0);
+  return values.map(v => (v-mean)/std);
+}
+
+function computeImpact(rows, preset="Balanced"){
+  const ps = computePasserStats(rows);
+  const rs = computeReceiverStats(rows);
+  const ds = computeDefenderStats(rows);
+  const asst = computeAssists(rows);
+
+  const players = uniq([
+    ...ps.map(x=>x.Player),
+    ...rs.map(x=>x.Player),
+    ...ds.map(x=>x.Player),
+    ...asst.map(x=>x.Player)
+  ]);
+
+  const getVal = (arr, name, field) => {
+    const f = arr.find(x=>x.Player===name);
+    return f ? (f[field]||0) : 0;
+  };
+
+  const table = players.map(p => ({
+    Player: p,
+    Assists: getVal(asst, p, "Assists"),
+    "Goals Caught": getVal(rs, p, "Goals Caught"),
+    Completions: getVal(ps, p, "Completions"),
+    Turnovers: getVal(ps, p, "Turnovers"),
+    "Passes Thrown": getVal(ps, p, "Passes Thrown"),
+    Catches: getVal(rs, p, "Catches"),
+    Blocks: getVal(ds, p, "Blocks"),
+    Pulls: getVal(ds, p, "Pulls"),
+    "Pulls OB": getVal(ds, p, "Pulls OB"),
+    Callahans: getVal(ds, p, "Callahans"),
+  }));
+
+  const metrics = ["Assists","Goals Caught","Completions","Turnovers","Passes Thrown","Catches","Blocks","Pulls","Pulls OB","Callahans"];
+  const zcols = {};
+  for(const m of metrics){
+    const vs = table.map(r=> +r[m] || 0);
+    const zs = zscore(vs);
+    zcols[m] = zs;
+  }
+
+  let w_off, w_def;
+  if(preset==="Offense"){
+    w_off = {"Assists":1.4,"Goals Caught":1.2,"Completions":0.8,"Turnovers":-1.2,"Passes Thrown":0.3,"Catches":0.4};
+    w_def = {"Blocks":0.8,"Callahans":1.4,"Pulls":0.2,"Pulls OB":-0.2};
+  }else if(preset==="Defense"){
+    w_off = {"Assists":0.8,"Goals Caught":0.6,"Completions":0.4,"Turnovers":-0.8,"Passes Thrown":0.2,"Catches":0.3};
+    w_def = {"Blocks":1.6,"Callahans":2.0,"Pulls":0.4,"Pulls OB":-0.4};
+  }else{
+    w_off = {"Assists":1.2,"Goals Caught":1.0,"Completions":0.6,"Turnovers":-1.0,"Passes Thrown":0.2,"Catches":0.3};
+    w_def = {"Blocks":1.2,"Callahans":2.0,"Pulls":0.3,"Pulls OB":-0.3};
+  }
+
+  const out = table.map((row, i)=>{
+    const OffImpact = Object.entries(w_off).reduce((acc,[k,w])=> acc + (zcols[k][i]*w), 0);
+    const DefImpact = Object.entries(w_def).reduce((acc,[k,w])=> acc + (zcols[k][i]*w), 0);
+    return {...row, OffImpact, DefImpact, ImpactScore: OffImpact + DefImpact};
+  });
+  out.sort((a,b)=> b.ImpactScore - a.ImpactScore);
+  return out;
+}
+
+// ---------- Rendering ----------
+function clearDiv(id){ byId(id).innerHTML=''; }
+
+function barDiv(id, x, y, title, opts={}){
+  const data = [{
+    type:'bar',
+    x, y,
+    text: y.map(v=> new Intl.NumberFormat().format(v)),
+    textposition:'auto'
+  }];
+  const layout = Object.assign({title, template:'plotly_white', margin:{t:40,l:40,r:20,b:60}}, opts);
+  Plotly.newPlot(id, data, layout, {responsive:true});
+}
+
+function pieDiv(id, labels, values, title){
+  Plotly.newPlot(id, [{
+    type:'pie', labels, values, hole:0.5
+  }], {title, template:'plotly_white', margin:{t:40,l:20,r:20,b:20}}, {responsive:true});
+}
+
+function groupBarDiv(id, x, series, seriesNames, title){
+  const data = series.map((ys,i)=>({type:'bar', x, y:ys, name:seriesNames[i]}));
+  Plotly.newPlot(id, data, {barmode:'group', title, template:'plotly_white', margin:{t:40,l:40,r:20,b:60}}, {responsive:true});
+}
+
+function stackBarDiv(id, x, series, seriesNames, title){
+  const data = series.map((ys,i)=>({type:'bar', x, y:ys, name:seriesNames[i]}));
+  Plotly.newPlot(id, data, {barmode:'stack', title, template:'plotly_white', margin:{t:40,l:40,r:20,b:60}}, {responsive:true});
+}
+
+function heatmapDiv(id, z, x, y, title, colorbarTitle){
+  Plotly.newPlot(id, [{
+    type:'heatmap', z, x, y, colorscale:'Blues', colorbar:{title:colorbarTitle||'Value'}
+  }], {title, template:'plotly_white', margin:{t:40,l:80,r:10,b:80}}, {responsive:true});
+}
+
+function sankeyDiv(id, syn, metric){
+  const passers = uniq(syn.map(r=>r.Passer));
+  const receivers = uniq(syn.map(r=>r.Receiver));
+  const nodes = passers.concat(receivers);
+  const index = {}; nodes.forEach((n,i)=> index[n]=i);
+  const source = syn.map(r=> index[r.Passer]);
+  const target = syn.map(r=> index[r.Receiver]);
+  const value = syn.map(r=> r[metric]);
+  const label = syn.map(r=> `${r.Passer} → ${r.Receiver} (${metric}: ${r[metric]}, Succ%: ${r["Success %"].toFixed(1)})`);
+  Plotly.newPlot(id, [{
+    type:'sankey',
+    node:{ label:nodes, pad:14, thickness:16 },
+    link:{ source, target, value, label }
+  }], {title:`Passing Flow (${metric})`, template:'plotly_white', margin:{t:40,l:10,r:10,b:10}}, {responsive:true});
+}
+
+// TEAM
+function renderTeam(){
+  const counts = teamCounts(DF);
+  barDiv('team-action', Object.keys(counts), Object.values(counts), 'Team Action Distribution');
+
+  const passers = computePasserStats(DF);
+  const totalComp = sum(passers.map(r=>r["Completions"]));
+  const totalTO = sum(passers.map(r=>r["Turnovers"]));
+  pieDiv('team-success-vs-tov', ['Completions','Turnovers'], [totalComp,totalTO], 'Success vs Turnover (Team)');
+
+  const tw = counts['Throwaway']||0;
+  const dr = counts['Drop']||0;
+  pieDiv('team-tov-types', ['Throwaways','Drops'], [tw,dr], 'Turnover Types');
+
+  const touches = computeTouches(DF).slice(0,15);
+  barDiv('team-touches', touches.map(r=>r.Player), touches.map(r=>r.Touches), 'Player Involvement (Touches)');
+
+  const receivers = computeReceiverStats(DF).slice(0,10);
+  groupBarDiv('team-top-receivers', receivers.map(r=>r.Player),
+              [receivers.map(r=>r["Goals Caught"]), receivers.map(r=>r["Catches"])],
+              ['Goals Caught','Catches'], 'Top Receivers');
+
+  const topPass = passers.slice(0,10);
+  stackBarDiv('team-succ-tov-passers', topPass.map(r=>r.Player),
+              [topPass.map(r=>r["Completions"]), topPass.map(r=>r["Turnovers"])],
+              ['Completions','Turnovers'], 'Success vs Turnover — Top Passers');
+  barDiv('team-tov-rate-passers', topPass.map(r=>r.Player), topPass.map(r=>r["Turnover %"]), 'Turnover Rate — Top Passers');
+
+  // Heatmap
+  const mat = connectionMatrix(DF, true);
+  const passersList = Object.keys(mat);
+  const recvSet = uniq(passersList.flatMap(p=> Object.keys(mat[p])));
+  const z = passersList.map(p => recvSet.map(r => (mat[p][r]||0)));
+  heatmapDiv('team-heatmap', z, recvSet, passersList, 'Pass Connections (Successful)', 'Passes');
+}
+
+// O-Line / D-Line helpers
+function subsetLine(rows, which){
+  if(!lineCol) return [];
+  return rows.filter(r => toLine(r[lineCol])===which);
+}
+
+function renderOLine(){
+  if(!lineCol){ byId('oline-action').innerHTML='<em>No O/D line information detected.</em>'; return; }
+  const rows = subsetLine(DF, 'O');
+  if(!rows.length){ byId('oline-action').innerHTML='<em>No O-line data for current filters.</em>'; return; }
+  const counts = teamCounts(rows);
+  barDiv('oline-action', Object.keys(counts), Object.values(counts), 'O-Line Action Distribution');
+
+  const passers = computePasserStats(rows);
+  barDiv('oline-top-passers', passers.slice(0,10).map(r=>r.Player), passers.slice(0,10).map(r=>r["Passes Thrown"]), 'Top Passers (Offense)');
+  const receivers = computeReceiverStats(rows).slice(0,10);
+  groupBarDiv('oline-top-receivers', receivers.map(r=>r.Player),
+              [receivers.map(r=>r["Goals Caught"]), receivers.map(r=>r["Catches"])],
+              ['Goals Caught','Catches'], 'Top Receivers (Offense)');
+  const top = passers.slice(0,10);
+  stackBarDiv('oline-succ-tov-passers', top.map(r=>r.Player),
+              [top.map(r=>r["Completions"]), top.map(r=>r["Turnovers"])],
+              ['Completions','Turnovers'], 'Success vs Turnover — Top Passers (Offense)');
+  barDiv('oline-tov-rate-passers', top.map(r=>r.Player), top.map(r=>r["Turnover %"]), 'Turnover Rate — Top Passers (Offense)');
+}
+
+function renderDLine(){
+  if(!lineCol){ byId('dline-action').innerHTML='<em>No O/D line information detected.</em>'; return; }
+  const rows = subsetLine(DF, 'D');
+  if(!rows.length){ byId('dline-action').innerHTML='<em>No D-line data for current filters.</em>'; return; }
+  const counts = teamCounts(rows);
+  barDiv('dline-action', Object.keys(counts), Object.values(counts), 'D-Line Action Distribution');
+
+  const def = computeDefenderStats(rows);
+  const allDef = def.map(d=> ({Player:d.Player, All:(d.Blocks||0)+(d.Pulls||0)+(d["Pulls OB"]||0)+(d.Callahans||0)}));
+  allDef.sort((a,b)=> b.All - a.All);
+  barDiv('dline-top-def-all', allDef.slice(0,10).map(r=>r.Player), allDef.slice(0,10).map(r=>r.All), 'Top Defenders (All Defense Events)');
+  const pullers = [...def].sort((a,b)=> b.Pulls - a.Pulls).slice(0,10);
+  barDiv('dline-top-pullers', pullers.map(r=>r.Player), pullers.map(r=>r.Pulls), 'Top Pullers');
+  const toc = def.map(d=> ({Player:d.Player, TOC:(d.Blocks||0)+(d.Callahans||0)})).sort((a,b)=> b.TOC - a.TOC).slice(0,10);
+  barDiv('dline-top-turnovers-caused', toc.map(r=>r.Player), toc.map(r=>r.TOC), 'Top Defenders Causing Turnovers');
+}
+
+// Player
+function renderPlayer(){
+  const sel = byId('playerSelect').value;
+  if(!sel){ byId('player-summary').innerHTML=''; Plotly.purge('player-pass-outcomes'); Plotly.purge('player-recv-dist'); Plotly.purge('player-overall-contrib'); return; }
+  const passers = computePasserStats(DF);
+  const receivers = computeReceiverStats(DF);
+  const defenders = computeDefenderStats(DF);
+  const assists = computeAssists(DF);
+
+  const find = (arr, f)=> arr.find(x=>x.Player===f);
+  const ps = find(passers, sel) || {"Passes Thrown":0,"Completions":0,"Turnovers":0,"Completion %":0,"Turnover %":0};
+  const rc = find(receivers, sel) || {"Catches":0,"Goals Caught":0};
+  const df = find(defenders, sel) || {"Blocks":0,"Pulls":0,"Pulls OB":0,"Callahans":0};
+  const as = find(assists, sel) || {"Assists":0};
+
+  byId('player-summary').innerHTML = `<strong>${sel}</strong> — ${ps["Passes Thrown"]} throws, ${ps["Completions"]} completions, ${ps["Turnovers"]} turnovers ${ps["Passes Thrown"]? `(${ps["Turnover %"].toFixed(1)}% TOV rate)`:''}. Catches: ${rc["Catches"]}, Goals: ${rc["Goals Caught"]}, Assists: ${as["Assists"]}, Blocks: ${df["Blocks"]}`;
+
+  const sub = DF.filter(r=> r.Passer===sel);
+  const po = [
+    {Outcome:"Completions", Count: sub.filter(r=> r.Action==="Catch"||r.Action==="Goal").length},
+    {Outcome:"Turnovers", Count: sub.filter(r=> r.Action==="Throwaway"||r.Action==="Drop").length},
+  ];
+  barDiv('player-pass-outcomes', po.map(x=>x.Outcome), po.map(x=>x.Count), 'Pass Outcomes');
+
+  const succ = DF.filter(r=> r.Passer===sel && (r.Action==="Catch"||r.Action==="Goal"));
+  const recCounts = {};
+  for(const r of succ){ recCounts[r.Receiver] = (recCounts[r.Receiver]||0)+1; }
+  const rd = Object.entries(recCounts).map(([Receiver,Successful])=>({Receiver,Successful})).sort((a,b)=> b.Successful - a.Successful).slice(0,10);
+  barDiv('player-recv-dist', rd.map(x=>x.Receiver), rd.map(x=>x.Successful), 'Receiver Distribution (Successful)');
+
+  const oc = ["Passes Thrown","Completions","Turnovers","Catches","Goals Caught","Assists","Blocks"].map(m=> ({
+    Metric:m, Count:(ps[m]||0)+(rc[m]||0)+(df[m]||0)+(as[m]||0)
+  }));
+  barDiv('player-overall-contrib', oc.map(x=>x.Metric), oc.map(x=>x.Count), 'Overall Contributions');
+}
+
+// Compare
+function renderCompare(){
+  const a = byId('cmpA').value;
+  const b = byId('cmpB').value;
+  if(!a || !b || a===b){ Plotly.purge('compare-chart'); byId('compare-table').innerHTML='<em>Select two different players.</em>'; return; }
+  const passers = computePasserStats(DF);
+  const receivers = computeReceiverStats(DF);
+  const defenders = computeDefenderStats(DF);
+  const assists = computeAssists(DF);
+  const merge = name => {
+    const P = passers.find(x=>x.Player===name) || {};
+    const R = receivers.find(x=>x.Player===name) || {};
+    const D = defenders.find(x=>x.Player===name) || {};
+    const A = assists.find(x=>x.Player===name) || {};
+    return {
+      Player:name,
+      "Passes Thrown": P["Passes Thrown"]||0, "Completions":P["Completions"]||0, "Turnovers":P["Turnovers"]||0,
+      "Catches":R["Catches"]||0,"Goals Caught":R["Goals Caught"]||0,
+      "Assists":A["Assists"]||0,"Blocks":D["Blocks"]||0,
+      "Completion %": P["Completion %"]||0, "Turnover %":P["Turnover %"]||0
+    };
+  };
+  const rows = [merge(a), merge(b)];
+  const metrics = ["Passes Thrown","Completions","Turnovers","Catches","Goals Caught","Assists","Blocks"];
+  const x = metrics;
+  const yA = metrics.map(m=> rows[0][m]);
+  const yB = metrics.map(m=> rows[1][m]);
+  groupBarDiv('compare-chart', x, [yA,yB], [a,b], 'Player Comparison');
+  byId('compare-table').innerHTML = `<pre>${JSON.stringify(rows, null, 2)}</pre>`;
+}
+
+// Synergy
+function renderSynergy(){
+  const synAll = synergy(DF);
+  let metric = document.querySelector('input[name="synMetric"]:checked').value;
+  const minAtt = parseInt(byId('synMin').value||'0',10);
+  const ego = byId('synEgo').value || null;
+  const normalize = byId('synNormalize').checked;
+
+  let syn = synAll.filter(r=> r.Attempts >= minAtt);
+  if(ego){ syn = syn.filter(r=> r.Passer===ego || r.Receiver===ego); }
+
+  if(!syn.length){
+    byId('syn-sankey').innerHTML = '<em>No pairs meet the criteria.</em>';
+    Plotly.purge('syn-heatmap');
+    return;
+  }
+  sankeyDiv('syn-sankey', syn, metric);
+
+  const passers = uniq(syn.map(r=> r.Passer));
+  const receivers = uniq(syn.map(r=> r.Receiver));
+  const mat = passers.map(p => receivers.map(r => {
+    const hit = syn.find(x=>x.Passer===p && x.Receiver===r);
+    return hit ? hit[metric] : 0;
+  }));
+  if(normalize){
+    for(let i=0;i<mat.length;i++){
+      const rowSum = mat[i].reduce((a,b)=>a+b,0)||1;
+      mat[i] = mat[i].map(v=> v/rowSum*100);
+    }
+  }
+  heatmapDiv('syn-heatmap', mat, receivers, passers, normalize? `Connection Heatmap — Per-passer % (${metric})` : `Connection Heatmap — ${metric}`, normalize? 'Share %': metric);
+}
+
+// Impact
+function renderImpact(){
+  const preset = document.querySelector('input[name="impactPreset"]:checked').value;
+  const imp = computeImpact(DF, preset);
+  const top = imp.slice(0,20);
+  barDiv('impact-bar', top.map(r=>r.Player), top.map(r=>r.ImpactScore), `Impact Scores — Top 20 (${preset})`);
+}
+
+// ---------- Tab switching ----------
+const tabs = document.querySelectorAll('.tab');
+tabs.forEach(btn => btn.addEventListener('click', () => {
+  tabs.forEach(b=> b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.tab-content').forEach(sec => sec.classList.remove('active'));
+  byId('tab-' + btn.dataset.tab).classList.add('active');
+  renderActiveTab();
+}));
+
+function renderActiveTab(){
+  const active = document.querySelector('.tab.active')?.dataset.tab;
+  if(!DF.length) return;
+  if(active==='team'){ renderTeam(); }
+  else if(active==='oline'){ renderOLine(); }
+  else if(active==='dline'){ renderDLine(); }
+  else if(active==='player'){ renderPlayer(); }
+  else if(active==='compare'){ renderCompare(); }
+  else if(active==='synergy'){ renderSynergy(); }
+  else if(active==='impact'){ renderImpact(); }
+}
+
+// Initial empty state
+// (renders after first applyFilters)
